@@ -262,3 +262,35 @@ def test_scalar_function_in_predicate_uses_expr():
     )
     match = generate_mongodb(plan).pipeline[0]["$match"]
     assert match == {"$expr": {"$eq": [{"$toUpper": "$country"}, "INDIA"]}}
+
+
+def test_computed_sort_key_is_materialized_and_removed():
+    plan = Project(
+        items=[("doubled", BinaryExpr(op="*", left=ColumnRef("age"), right=_lit(2)))],
+        input=Sort(
+            keys=[
+                (
+                    BinaryExpr(op="*", left=ColumnRef("age"), right=_lit(2)),
+                    False,
+                )
+            ],
+            input=Scan(collection="users"),
+        ),
+    )
+    pipeline = generate_mongodb(plan).pipeline
+    # A temporary field is created, sorted on, and then removed.
+    assert "$addFields" in pipeline[0]
+    temp = next(iter(pipeline[0]["$addFields"]))
+    assert pipeline[1] == {"$sort": {temp: 1}}
+    assert pipeline[2] == {"$project": {temp: 0}}
+    # The final projection exposes only the requested output field.
+    assert pipeline[-1] == {"$project": {"doubled": {"$multiply": ["$age", 2]}}}
+
+
+def test_sort_on_plain_column_adds_no_temp_field():
+    plan = Project(
+        items=[("name", ColumnRef("name"))],
+        input=Sort(keys=[(ColumnRef("age"), True)], input=Scan(collection="users")),
+    )
+    pipeline = generate_mongodb(plan).pipeline
+    assert pipeline == [{"$sort": {"age": -1}}, {"$project": {"name": "$name"}}]

@@ -1,5 +1,6 @@
 """Tests for AST-to-IR lowering and plan utilities."""
 from optisql.ir import (
+    BinaryExpr,
     ColumnRef,
     Distinct,
     Filter,
@@ -64,9 +65,29 @@ def test_filter_expression_lowering(sample_catalog):
 
 def test_order_by_lowering(sample_catalog):
     plan = build("SELECT name FROM users ORDER BY name DESC")
-    assert isinstance(plan, Sort)
-    expr, desc = plan.keys[0]
+    # Project -> Sort -> Scan: the sort sits below the projection so sort keys
+    # need not be part of the SELECT list.
+    assert isinstance(plan, Project)
+    assert isinstance(plan.input, Sort)
+    expr, desc = plan.input.keys[0]
     assert desc is True
+    assert expr.name == "name"
+
+
+def test_order_by_non_projected_column_keeps_sort_below_projection(sample_catalog):
+    plan = build("SELECT name FROM users ORDER BY age")
+    assert isinstance(plan, Project)
+    assert isinstance(plan.input, Sort)
+    key_expr, _ = plan.input.keys[0]
+    assert key_expr.name == "age"
+
+
+def test_order_by_alias_resolves_to_expression(sample_catalog):
+    plan = build("SELECT age * 2 AS doubled FROM users ORDER BY doubled")
+    assert isinstance(plan, Project)
+    assert isinstance(plan.input, Sort)
+    key_expr, _ = plan.input.keys[0]
+    assert isinstance(key_expr, BinaryExpr)
 
 
 def test_limit_and_offset_order(sample_catalog):

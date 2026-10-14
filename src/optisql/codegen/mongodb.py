@@ -231,17 +231,26 @@ class MongoDBGenerator:
 
     def _handle_sort(self, node: Sort) -> None:
         sort_spec = {}
-        for expr, desc in node.keys:
+        temp_fields: List[str] = []
+        for index, (expr, desc) in enumerate(node.keys):
             if isinstance(expr, ColumnRef):
-                sort_spec[expr.name] = -1 if desc else 1
+                key = expr.name
             else:
-                self.diagnostics.error(
-                    "E7002",
-                    "MongoDB $sort currently supports column references only",
-                    None,
+                # MongoDB $sort accepts field paths, not expressions. Materialize
+                # computed keys in a temporary field, then remove them so the
+                # output shape is unchanged.
+                key = f"_optisql_sort_{index}"
+                self._pipeline.append(
+                    {"$addFields": {key: self._expr_to_mongo(expr)}}
                 )
+                temp_fields.append(key)
+            sort_spec[key] = -1 if desc else 1
         if sort_spec:
             self._pipeline.append({"$sort": sort_spec})
+        if temp_fields:
+            self._pipeline.append(
+                {"$project": {field: 0 for field in temp_fields}}
+            )
 
     def _handle_limit(self, node: Limit) -> None:
         self._pipeline.append({"$limit": node.count})

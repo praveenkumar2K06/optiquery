@@ -7,7 +7,10 @@ Lowering preserves SQL semantics:
 * ``HAVING`` becomes a :class:`Filter` over the grouped result,
 * the projection is expressed as a :class:`Project` over the grouped or scanned
   result,
-* ``ORDER BY`` wraps the plan in a :class:`Sort`,
+* ``ORDER BY`` for a plain ``SELECT`` is applied below the projection so sort
+  keys remain visible even when they are not in the SELECT list,
+* ``ORDER BY`` over aggregates is applied above the grouped projection whose
+  output columns the keys reference,
 * ``OFFSET``/``LIMIT`` become :class:`Skip`/:class:`Limit`.
 
 Aggregate calls are collected once and replaced by references to the group's
@@ -98,22 +101,40 @@ class PlanLowerer:
     # -- SELECT ------------------------------------------------------------
 
     def _lower_select(self, stmt: SelectStatement) -> LogicalPlan:
-        plan: LogicalPlan = self._build_base_scan(stmt)
+        base: LogicalPlan = self._build_base_scan(stmt)
 
         if stmt.where is not None:
-            plan = Filter(predicate=self._lower_expr(stmt.where), input=plan)
+            base = Filter(predicate=self._lower_expr(stmt.where), input=base)
 
         is_aggregate = bool(stmt.group_by) or self._stmt_has_aggregates(stmt)
 
         if is_aggregate:
-            plan = self._lower_aggregate_select(stmt, plan)
+            # Aggregate output columns are only available after the Group (and
+            # its projection), so ORDER BY stays above the projection here.
+            plan = self._lower_aggregate_select(stmt, base)
+            return self._wrap_sort_and_pagination(stmt, plan)
+
+        project = self._lower_plain_select(stmt, base)
+
+        if stmt.distinct:
+            # SQL requires ORDER BY with DISTINCT to reference SELECT-list
+            # columns, which the projection produces, so sorting after
+            # DISTINCT/Project is correct.
+            plan = Distinct(input=project)
+            return self._wrap_sort_and_pagination(stmt, plan)
+
+        # Plain SELECT: apply ORDER BY *below* the projection. This keeps the
+        # sort keys visible even when they are not part of the SELECT list
+        # (e.g. SELECT name FROM users ORDER BY age).
+        order_keys = self._lower_plain_order_keys(stmt)
+        if order_keys:
+            plan: LogicalPlan = Project(
+                items=project.items,
+                input=Sort(keys=order_keys, input=project.input),
+            )
         else:
-            plan = self._lower_plain_select(stmt, plan)
-
-        if stmt.distinct and not is_aggregate:
-            plan = Distinct(input=plan)
-
-        return self._wrap_sort_and_pagination(stmt, plan)
+            plan = project
+        return self._wrap_pagination(stmt, plan)
 
     def _build_base_scan(self, stmt: SelectStatement) -> LogicalPlan:
         if stmt.from_table is None:
@@ -371,12 +392,40 @@ class PlanLowerer:
                 expr = self._lower_order_expr(order.expr)
                 keys.append((expr, order.descending))
             plan = Sort(keys=keys, input=plan)
+        return self._wrap_pagination(stmt, plan)
 
+    def _wrap_pagination(
+        self, stmt: SelectStatement, plan: LogicalPlan
+    ) -> LogicalPlan:
         if stmt.offset is not None and isinstance(stmt.offset, Literal):
             plan = Skip(count=int(stmt.offset.value), input=plan)
         if stmt.limit is not None and isinstance(stmt.limit, Literal):
             plan = Limit(count=int(stmt.limit.value), input=plan)
         return plan
+
+    def _lower_plain_order_keys(
+        self, stmt: SelectStatement
+    ) -> List[Tuple[IRExpr, bool]]:
+        """Lower ORDER BY keys against the pre-projection input.
+
+        Select-list aliases are substituted with their underlying expressions so
+        that ``ORDER BY alias`` still resolves when the sort sits below the
+        projection.
+        """
+        aliases: Dict[str, Expr] = {}
+        for item in stmt.items:
+            if item.alias:
+                aliases[item.alias.lower()] = item.expr
+
+        keys: List[Tuple[IRExpr, bool]] = []
+        for order in stmt.order_by:
+            expr = order.expr
+            if isinstance(expr, Identifier) and len(expr.parts) == 1:
+                target = aliases.get(expr.parts[0].lower())
+                if target is not None:
+                    expr = target
+            keys.append((self._lower_expr(expr), order.descending))
+        return keys
 
     def _lower_order_expr(self, expr: Expr) -> IRExpr:
         if self._agg_key_to_name:

@@ -103,8 +103,11 @@ Flags: `--backend/-b`, `--schema/-s`, `--no-optimize`, `--explain`, `--ast`,
 from optisql.compiler import Compiler
 from optisql.backends import get_backend
 from optisql.execution import QueryExecutor
+from optisql.metadata import Catalog
 
-compiler = Compiler(backend="mongodb")          # permissive catalog
+# A permissive catalog treats unknown collections as unresolved (with a
+# warning) instead of an error. Pass a populated Catalog for strict checking.
+compiler = Compiler(catalog=Catalog(strict=False), backend="mongodb")
 result = compiler.compile("SELECT name FROM users WHERE age >= 18 LIMIT 5")
 
 print(result.ok)                       # True

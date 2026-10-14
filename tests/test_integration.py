@@ -34,11 +34,15 @@ def test_select_filter_sort_limit(compiler):
     )
     assert result.ok
     pipeline = result.generated
-    stages = {next(iter(stage)) for stage in pipeline}
-    assert stages == {"$match", "$project", "$sort", "$limit"}
+    stages = [next(iter(stage)) for stage in pipeline]
+    assert stages[0] == "$match"
     assert pipeline[0] == {"$match": {"age": {"$gte": 18}}}
     assert {"$sort": {"age": -1}} in pipeline
-    assert pipeline[-1] == {"$limit": 5}
+    assert {"$limit": 5} in pipeline
+    # Sort must precede limit for the ordering to be meaningful.
+    assert stages.index("$sort") < stages.index("$limit")
+    # Projection is the final output shape.
+    assert pipeline[-1] == {"$project": {"name": "$name", "age": "$age"}}
 
 
 def test_select_star_does_not_narrow_projection(compiler):
@@ -87,6 +91,16 @@ def test_between_and_in_predicates(compiler):
     match = result.generated[0]["$match"]
     assert {"age": {"$gte": 18, "$lte": 30}} in match["$and"]
     assert {"country": {"$in": ["India", "US"]}} in match["$and"]
+
+
+def test_order_by_non_projected_column(compiler):
+    # ORDER BY a column that is not in the SELECT list must still order by it:
+    # the sort has to run before the projection drops the field.
+    result = compiler().compile("SELECT name FROM users ORDER BY age")
+    assert result.ok
+    stages = [next(iter(stage)) for stage in result.generated]
+    assert stages.index("$sort") < stages.index("$project")
+    assert {"$sort": {"age": 1}} in result.generated
 
 
 def test_optimization_passes_run_and_are_traced(compiler):
