@@ -94,6 +94,40 @@ def test_limit_and_skip_pipeline():
     assert {"$skip": 5} in pipeline
 
 
+def test_limit_zero_is_always_false_not_invalid_limit():
+    plan = Limit(count=0, input=Scan(collection="users"))
+    pipeline = generate_mongodb(plan).pipeline
+    # MongoDB $limit requires a positive integer, so LIMIT 0 must not emit
+    # {"$limit": 0}.
+    assert {"$limit": 0} not in pipeline
+    assert pipeline == [{"$match": {"$expr": {"$eq": [1, 0]}}}]
+
+
+def test_like_escapes_regex_metacharacters():
+    from optisql.ir import LikeExpr
+
+    plan = Filter(
+        predicate=LikeExpr(
+            operand=ColumnRef("name"),
+            pattern=_lit("a.b%", "string"),
+        ),
+        input=Scan(collection="users"),
+    )
+    match = generate_mongodb(plan).pipeline[0]["$match"]
+    assert match == {"name": {"$regex": "^a\\.b.*$"}}
+
+
+def test_like_translates_wildcards():
+    from optisql.ir import LikeExpr
+
+    plan = Filter(
+        predicate=LikeExpr(operand=ColumnRef("name"), pattern=_lit("_x%", "string")),
+        input=Scan(collection="users"),
+    )
+    match = generate_mongodb(plan).pipeline[0]["$match"]
+    assert match == {"name": {"$regex": "^.x.*$"}}
+
+
 def test_group_with_count():
     plan = Group(
         group_keys=[ColumnRef("country")],

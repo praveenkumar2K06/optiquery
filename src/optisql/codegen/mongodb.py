@@ -8,6 +8,7 @@ that can be represented in an aggregation pipeline.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,6 +48,24 @@ class MongoPipelineResult:
 
     def to_json(self) -> str:
         return json.dumps(self.pipeline, indent=2, default=str)
+
+
+def _like_to_regex(pattern: str) -> str:
+    """Translate a SQL LIKE pattern into an anchored regex.
+
+    ``%`` becomes ``.*`` and ``_`` becomes ``.``; every other character is
+    escaped so that regex metacharacters in the pattern (``.``, ``+``, ``(``…)
+    are matched literally, preserving SQL LIKE semantics.
+    """
+    pieces: List[str] = []
+    for char in pattern:
+        if char == "%":
+            pieces.append(".*")
+        elif char == "_":
+            pieces.append(".")
+        else:
+            pieces.append(re.escape(char))
+    return "^" + "".join(pieces) + "$"
 
 
 class MongoDBGenerator:
@@ -206,7 +225,7 @@ class MongoDBGenerator:
         if isinstance(expr, LikeExpr):
             pattern = self._literal_string(expr.pattern)
             if pattern is not None and isinstance(expr.operand, ColumnRef):
-                regex = "^" + pattern.replace("%", ".*").replace("_", ".") + "$"
+                regex = _like_to_regex(pattern)
                 query = {expr.operand.name: {"$regex": regex}}
                 return {"$nor": [query]} if expr.negated else query
             return {"$expr": self._expr_to_mongo(expr)}
@@ -257,6 +276,11 @@ class MongoDBGenerator:
             )
 
     def _handle_limit(self, node: Limit) -> None:
+        if node.count <= 0:
+            # MongoDB $limit requires a positive integer; LIMIT 0 returns no
+            # rows, which we express as an always-false predicate.
+            self._pipeline.append({"$match": {"$expr": {"$eq": [1, 0]}}})
+            return
         self._pipeline.append({"$limit": node.count})
 
     def _handle_skip(self, node: Skip) -> None:
@@ -451,12 +475,11 @@ class MongoDBGenerator:
                 return {"$ne": [self._expr_to_mongo(expr.operand), None]}
             return {"$eq": [self._expr_to_mongo(expr.operand), None]}
         if isinstance(expr, LikeExpr):
-            # A full regex for LIKE '%term%' is a simple approximation for the
-            # small supported subset. The cost model doesn't depend on the
-            # exact regex string, only on correctness.
+            # LIKE is translated to an anchored regular expression. Metacharacters
+            # in the pattern are escaped so SQL semantics are preserved.
             pattern = self._literal_string(expr.pattern)
             if pattern is not None:
-                regex = "^" + pattern.replace("%", ".*").replace("_", ".") + "$"
+                regex = _like_to_regex(pattern)
                 return {"$regexMatch": {"input": self._expr_to_mongo(expr.operand), "regex": regex}}
         if isinstance(expr, InListExpr):
             cond = {"$in": [self._expr_to_mongo(expr.operand), [self._expr_to_mongo(o) for o in expr.options]]}
