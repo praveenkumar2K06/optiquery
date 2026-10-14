@@ -14,6 +14,7 @@ import json
 import sys
 from typing import List, Optional
 
+from ..backends import available_backends
 from ..compiler import Compiler
 from ..ir import plan_to_json, plan_to_string
 from ..metadata import Catalog, CollectionSchema, FieldDef, FieldType
@@ -45,7 +46,13 @@ def _load_catalog(path: Optional[str]) -> Catalog:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="optisql", description="OptiQuery SQL-to-NoSQL compiler")
     ap.add_argument("sql", nargs="?", help="SQL query text to compile")
-    ap.add_argument("--backend", "-b", default="mongodb", choices=["mongodb", "redis"])
+    ap.add_argument(
+        "--backend",
+        "-b",
+        default="mongodb",
+        choices=available_backends(),
+        help="Target NoSQL backend",
+    )
     ap.add_argument("--schema", "-s", help="Path to a JSON schema file")
     ap.add_argument("--no-optimize", action="store_true", help="Disable optimization passes")
     ap.add_argument("--explain", action="store_true", help="Print plan explanations")
@@ -69,12 +76,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     result = compiler.compile(args.sql)
 
     if args.json:
+        operation = result.backend_operation
         payload = {
             "ok": result.ok,
             "backend": result.backend,
             "plan": plan_to_json(result.optimized_plan) if result.optimized_plan else None,
-            "pipeline": getattr(result.generated, "pipeline", None),
-            "commands": getattr(result.generated, "commands", None),
+            "query": operation.query if operation is not None else None,
             "cost": (
                 result.optimization.cost_breakdown.total
                 if result.optimization and result.optimization.cost_breakdown
@@ -119,16 +126,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"  {'TOTAL':<10} {cost.total:.6f}")
             print()
 
-    generated = result.generated
+    generated = result.backend_operation
     if generated is not None:
-        pipeline = getattr(generated, "pipeline", None)
-        commands = getattr(generated, "commands", None)
-        if pipeline is not None:
+        if result.backend == "mongodb":
             print("=== MongoDB Aggregation Pipeline ===")
-            print(json.dumps(pipeline, indent=2, default=str))
-        if commands is not None:
+            print(json.dumps(generated.query, indent=2, default=str))
+        elif result.backend == "redis":
             print("=== Redis Commands ===")
-            print(json.dumps(commands, indent=2, default=str))
+            print(json.dumps(generated.query, indent=2, default=str))
+        else:
+            print(f"=== {result.backend} Query ===")
+            print(json.dumps(generated.query, indent=2, default=str))
 
     if result.diagnostics.items:
         print()

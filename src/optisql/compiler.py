@@ -16,8 +16,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .ast import Statement
-from .codegen.mongodb import generate_mongodb
-from .codegen.redis import generate_redis
+from .backends import Backend, BackendOperation, get_backend
 from .diagnostics import Diagnostic, DiagnosticBag
 from .ir import LogicalPlan, plan_to_string
 from .metadata import Catalog
@@ -39,6 +38,7 @@ class CompilationResult:
     logical_plan: Optional[LogicalPlan] = None
     optimization: Optional[OptimizationResult] = None
     generated: object = None
+    backend_operation: Optional[BackendOperation] = None
     diagnostics: DiagnosticBag = field(default_factory=DiagnosticBag)
     ast_debug: Optional[str] = None
 
@@ -69,10 +69,21 @@ class Compiler:
         catalog: Optional[Catalog] = None,
         backend: str = "mongodb",
         enable_optimizations: bool = True,
+        backend_adapter: Optional[Backend] = None,
     ):
         self.catalog = catalog if catalog is not None else Catalog()
-        self.backend = backend
+        self.backend = backend if backend_adapter is None else backend_adapter.name
         self.enable_optimizations = enable_optimizations
+        self.backend_adapter = backend_adapter
+
+    def _resolve_backend(self) -> Optional[Backend]:
+        if self.backend_adapter is not None:
+            return self.backend_adapter
+        try:
+            self.backend_adapter = get_backend(self.backend)
+        except ValueError:
+            return None
+        return self.backend_adapter
 
     def compile(self, source: str) -> CompilationResult:
         result = CompilationResult(source=source, backend=self.backend)
@@ -107,16 +118,15 @@ class Compiler:
         result.optimization = opt
 
         # Phase 8/9: Backend code generation.
-        codegen_bag = DiagnosticBag()
-        if self.backend == "mongodb":
-            gen = generate_mongodb(opt.optimized, codegen_bag)
-            result.generated = gen
-        elif self.backend == "redis":
-            gen = generate_redis(opt.optimized, codegen_bag)
-            result.generated = gen
-        else:
+        backend = self._resolve_backend()
+        if backend is None:
             diagnostics.error("E9001", f"Unknown backend '{self.backend}'", None)
-        diagnostics.extend(codegen_bag.items)
+            return result
+
+        operation = backend.generate(opt.optimized)
+        result.backend_operation = operation
+        result.generated = operation.query
+        diagnostics.extend(operation.diagnostics.items)
 
         return result
 
