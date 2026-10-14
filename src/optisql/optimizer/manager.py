@@ -24,8 +24,8 @@ class PassManager:
             ProjectionPushdownPass(),
             FilterReorderingPass(),
             ConstantFoldingPass(),
-            CommonSubexpressionEliminationPass(),
             LimitPushdownPass(),
+            CommonSubexpressionEliminationPass(),
         ]
 
     def run(self, plan: LogicalPlan) -> LogicalPlan:

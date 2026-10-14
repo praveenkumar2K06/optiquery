@@ -12,7 +12,9 @@ from optisql.ir import (
 from optisql.ir.serialize import expr_to_string
 from optisql.metadata import FieldType
 from optisql.optimizer.passes.constant import ConstantFoldingPass
+from optisql.optimizer.passes.cse import CommonSubexpressionEliminationPass
 from optisql.optimizer.passes.filter import FilterReorderingPass
+from optisql.optimizer.passes.limit import LimitPushdownPass
 from optisql.optimizer.passes.projection import ProjectionPushdownPass
 
 
@@ -178,3 +180,105 @@ def test_pushdown_includes_group_and_sort_fields():
     assert isinstance(scan, Scan)
     assert "total" in scan.projection
     assert "country" in scan.projection
+
+
+# -- Common subexpression elimination (DAG sharing) ------------------------
+
+
+def _duplicate_branch_plan():
+    from optisql.ir import Join
+
+    predicate = BinaryExpr(op=">", left=ColumnRef("age"), right=lit(18))
+    left = Filter(predicate=predicate, input=Scan(collection="users"))
+    right = Filter(predicate=predicate, input=Scan(collection="users"))
+    return Join(left=left, right=right, condition=None)
+
+
+def test_cse_shares_identical_subtrees():
+    plan = _duplicate_branch_plan()
+    p = CommonSubexpressionEliminationPass()
+    result = p.apply(plan)
+    assert p.changes >= 1
+    # The two identical branches should now be the same object (a DAG).
+    assert result.left is result.right
+    # ...and the shared scan is shared too.
+    assert result.left.input is result.right.input
+
+
+def test_cse_leaves_unique_plan_unchanged():
+    from optisql.ir import Sort
+
+    plan = Sort(
+        keys=[(ColumnRef("age"), False)],
+        input=Filter(
+            predicate=BinaryExpr(op=">", left=ColumnRef("age"), right=lit(18)),
+            input=Scan(collection="users"),
+        ),
+    )
+    p = CommonSubexpressionEliminationPass()
+    result = p.apply(plan)
+    assert p.changes == 0
+    assert plan_to_string(result) == plan_to_string(plan)
+
+
+def test_cse_does_not_mutate_input_plan():
+    plan = _duplicate_branch_plan()
+    before = plan_to_string(plan)
+    CommonSubexpressionEliminationPass().apply(plan)
+    assert plan_to_string(plan) == before
+    # The original plan is still a tree (no sharing introduced).
+    assert plan.left is not plan.right
+
+
+# -- Limit pushdown --------------------------------------------------------
+
+
+def test_limit_pushed_below_projection():
+    from optisql.ir import Limit
+
+    plan = Limit(
+        count=10,
+        input=Project(
+            items=[("name", ColumnRef("name"))],
+            input=Filter(
+                predicate=BinaryExpr(op=">", left=ColumnRef("age"), right=lit(18)),
+                input=Scan(collection="users"),
+            ),
+        ),
+    )
+    p = LimitPushdownPass()
+    result = p.apply(plan)
+    assert p.changes == 1
+    assert isinstance(result, Project)
+    assert isinstance(result.input, Limit)
+    assert isinstance(result.input.input, Filter)
+
+
+def test_limit_not_pushed_below_filter():
+    from optisql.ir import Limit
+
+    plan = Limit(
+        count=10,
+        input=Filter(
+            predicate=BinaryExpr(op=">", left=ColumnRef("age"), right=lit(18)),
+            input=Scan(collection="users"),
+        ),
+    )
+    p = LimitPushdownPass()
+    result = p.apply(plan)
+    assert p.changes == 0
+    assert isinstance(result, Limit)
+
+
+def test_limit_pushdown_is_idempotent():
+    from optisql.ir import Limit
+
+    plan = Limit(
+        count=5,
+        input=Project(items=[("name", ColumnRef("name"))], input=Scan(collection="users")),
+    )
+    p = LimitPushdownPass()
+    once = p.apply(plan)
+    twice = p.apply(once)
+    assert p.changes == 0  # second run makes no further change
+    assert plan_to_string(once) == plan_to_string(twice)
