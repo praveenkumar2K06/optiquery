@@ -270,21 +270,40 @@ class MongoDBGenerator:
         self._pipeline.append({"$group": group})
 
     def _handle_distinct(self, node: Distinct) -> None:
-        # MongoDB distinct is typically a db.collection.distinct(), but in
-        # aggregation one can use $group and $project. We'll emit a $group
-        # that groups by all fields visible from the upstream project when we can;
-        # for the basic subset this is a conservative, explicit fallback.
+        # MongoDB has no standalone DISTINCT in aggregation; the correct
+        # lowering groups by the output fields and projects them back out.
+        # We can only do that when the fields are statically enumerable.
+        fields = self._distinct_fields(node)
+        if fields is None:
+            self.diagnostics.error(
+                "E7004",
+                "MongoDB DISTINCT requires an enumerable projection; "
+                "SELECT DISTINCT * over an unknown field set is not supported",
+                None,
+            )
+            return
         self._had_distinct = True
-        self.diagnostics.warning(
-            "W7001",
-            "MongoDB DISTINCT generated via $group (shapes may differ from input)",
-            None,
-        )
-        # A generic $group is hard to produce without schema of projected keys;
-        # emit $group by null aggregates empty and let caller interpret. In
-        # practice, simpler plans avoid DISTINCT after projection; we document.
-        self._pipeline.append({"$group": {"_id": None}})
-        self._pipeline.append({"$project": {"_id": 0}})
+        group_id: Dict[str, Any] = {f: "$" + f for f in fields}
+        self._pipeline.append({"$group": {"_id": group_id}})
+        projection: Dict[str, Any] = {"_id": 0}
+        for f in fields:
+            projection[f] = "$_id." + f
+        self._pipeline.append({"$project": projection})
+
+    @staticmethod
+    def _distinct_fields(node: Distinct) -> Optional[List[str]]:
+        """Field names produced by the input to a DISTINCT, if enumerable."""
+        source = node.input
+        if isinstance(source, Project):
+            fields: List[str] = []
+            for name, expr in source.items:
+                if name == "*" or (isinstance(expr, LiteralValue) and expr.value == "*"):
+                    return None
+                fields.append(name)
+            return fields or None
+        if isinstance(source, Scan) and source.projection:
+            return list(source.projection)
+        return None
 
     def _function_to_mongo(self, func: FunctionExpr) -> Optional[Dict[str, Any]]:
         name = func.name.upper()

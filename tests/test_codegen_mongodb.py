@@ -3,6 +3,7 @@ from optisql.codegen.mongodb import MongoDBGenerator, generate_mongodb
 from optisql.ir import (
     BinaryExpr,
     ColumnRef,
+    Distinct,
     Filter,
     FunctionExpr,
     Group,
@@ -162,3 +163,26 @@ def test_inequality_and_null_handling():
     )
     match = generate_mongodb(plan).pipeline[0]["$match"]
     assert match == {"status": {"$ne": "closed"}}
+
+
+def test_distinct_groups_by_projected_fields():
+    plan = Distinct(
+        input=Project(
+            items=[("country", ColumnRef("country")), ("age", ColumnRef("age"))],
+            input=Scan(collection="users"),
+        )
+    )
+    pipeline = generate_mongodb(plan).pipeline
+    group = next(s["$group"] for s in pipeline if "$group" in s)
+    assert group["_id"] == {"country": "$country", "age": "$age"}
+    final = pipeline[-1]["$project"]
+    assert final == {"_id": 0, "country": "$_id.country", "age": "$_id.age"}
+
+
+def test_distinct_star_is_rejected_not_wrong():
+    plan = Distinct(input=Scan(collection="users"))
+    result = generate_mongodb(plan)
+    assert result.diagnostics.has_errors
+    assert any(d.code == "E7004" for d in result.diagnostics.errors)
+    # No misleading pipeline is produced.
+    assert result.pipeline == []
