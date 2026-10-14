@@ -65,6 +65,28 @@ def test_group_by_with_having(compiler):
     assert any(s.get("$match", {}).get("n") == {"$gt": 5} for s in result.generated)
 
 
+def test_group_by_restores_key_name(compiler):
+    result = compiler().compile("SELECT country, COUNT(*) AS n FROM users GROUP BY country")
+    assert result.ok
+    # A stage must recreate "country" from the group's _id.
+    restore = next(
+        s for s in result.generated
+        if "$project" in s and s["$project"].get("country") == "$_id"
+    )
+    assert restore["$project"]["_id"] == 0
+
+
+def test_count_distinct_end_to_end(compiler):
+    result = compiler().compile("SELECT COUNT(DISTINCT country) AS c FROM users")
+    assert result.ok
+    group = next(s["$group"] for s in result.generated if "$group" in s)
+    assert group["__c_distinct"] == {"$addToSet": "$country"}
+    assert any(
+        s.get("$project", {}).get("c") == {"$size": "$__c_distinct"}
+        for s in result.generated
+    )
+
+
 def test_distinct_is_semantically_correct(compiler):
     result = compiler().compile("SELECT DISTINCT country FROM users")
     assert result.ok

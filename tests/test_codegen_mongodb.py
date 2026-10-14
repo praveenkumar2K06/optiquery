@@ -294,3 +294,65 @@ def test_sort_on_plain_column_adds_no_temp_field():
     )
     pipeline = generate_mongodb(plan).pipeline
     assert pipeline == [{"$sort": {"age": -1}}, {"$project": {"name": "$name"}}]
+
+
+def test_group_by_restores_key_as_named_field():
+    plan = Project(
+        items=[("country", ColumnRef("country")), ("n", ColumnRef("n"))],
+        input=Group(
+            group_keys=[ColumnRef("country")],
+            aggregates=[("n", FunctionExpr(name="COUNT", args=(ColumnRef("*"),)))],
+            input=Scan(collection="users"),
+        ),
+    )
+    pipeline = generate_mongodb(plan).pipeline
+    assert pipeline[0] == {"$group": {"_id": "$country", "n": {"$sum": 1}}}
+    # The key is restored from _id, and the aggregate output is preserved.
+    assert pipeline[1] == {"$project": {"_id": 0, "country": "$_id", "n": 1}}
+
+
+def test_group_by_multiple_keys_restore_paths():
+    plan = Group(
+        group_keys=[ColumnRef("country"), ColumnRef("age")],
+        aggregates=[],
+        input=Scan(collection="users"),
+    )
+    pipeline = generate_mongodb(plan).pipeline
+    assert pipeline[0]["$group"]["_id"] == {"country": "$country", "age": "$age"}
+    assert pipeline[1] == {
+        "$project": {"_id": 0, "country": "$_id.country", "age": "$_id.age"}
+    }
+
+
+def test_count_distinct_uses_add_to_set():
+    plan = Group(
+        aggregates=[
+            (
+                "c",
+                FunctionExpr(
+                    name="COUNT",
+                    args=(ColumnRef("country"),),
+                    distinct=True,
+                ),
+            )
+        ],
+        input=Scan(collection="users"),
+    )
+    pipeline = generate_mongodb(plan).pipeline
+    assert pipeline[0]["$group"]["__c_distinct"] == {"$addToSet": "$country"}
+    assert pipeline[1]["$project"]["c"] == {"$size": "$__c_distinct"}
+
+
+def test_sum_distinct_uses_add_to_set():
+    plan = Group(
+        aggregates=[
+            (
+                "s",
+                FunctionExpr(name="SUM", args=(ColumnRef("age"),), distinct=True),
+            )
+        ],
+        input=Scan(collection="users"),
+    )
+    pipeline = generate_mongodb(plan).pipeline
+    assert pipeline[0]["$group"]["__s_distinct"] == {"$addToSet": "$age"}
+    assert pipeline[1]["$project"]["s"] == {"$sum": "$__s_distinct"}

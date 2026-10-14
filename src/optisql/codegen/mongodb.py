@@ -260,30 +260,77 @@ class MongoDBGenerator:
 
     def _handle_group(self, node: Group) -> None:
         group: Dict[str, Any] = {"_id": {}}
+        #: output-name -> path expression that recovers a group key after $group
+        key_restore: Dict[str, Any] = {}
         if node.group_keys:
             if len(node.group_keys) == 1:
                 key = node.group_keys[0]
                 if isinstance(key, ColumnRef):
                     group["_id"] = "$" + key.name
+                    key_restore[key.name] = "$_id"
                 else:
                     group["_id"] = self._expr_to_mongo(key)
             else:
                 _id = {}
-                for key in node.group_keys:
+                for index, key in enumerate(node.group_keys):
                     if isinstance(key, ColumnRef):
                         _id[key.name] = "$" + key.name
+                        key_restore[key.name] = "$_id." + key.name
                     else:
-                        _id["expr"] = self._expr_to_mongo(key)
+                        _id[f"key{index}"] = self._expr_to_mongo(key)
                 group["_id"] = _id
         else:
             group["_id"] = None
 
+        #: output-name -> path that recovers an accumulator value after a
+        #: DISTINCT aggregate is computed in two stages.
+        distinct_recover: Dict[str, Any] = {}
+        #: aggregate outputs that remain plain fields after $group
+        agg_outputs: List[str] = []
+
         for out_name, agg in node.aggregates:
+            is_distinct = isinstance(agg, FunctionExpr) and agg.distinct
+            if is_distinct and agg.name.upper() in ("COUNT", "SUM", "AVG"):
+                # Collect distinct values first; the final value is computed
+                # from the set in the follow-up $project.
+                arg = agg.args[0] if agg.args else None
+                if arg is None:
+                    self._failed = True
+                    self.diagnostics.error(
+                        "E7006",
+                        f"{agg.name}(DISTINCT ...) requires an argument",
+                        None,
+                    )
+                    continue
+                temp = f"__{out_name}_distinct"
+                group[temp] = {"$addToSet": self._expr_to_mongo(arg)}
+                if agg.name.upper() == "COUNT":
+                    distinct_recover[out_name] = {"$size": "$" + temp}
+                elif agg.name.upper() == "SUM":
+                    distinct_recover[out_name] = {"$sum": "$" + temp}
+                else:  # AVG
+                    distinct_recover[out_name] = {"$avg": "$" + temp}
+                continue
+            # MIN/MAX are unaffected by DISTINCT; other aggregates fall through.
             mongo_agg = self._function_to_mongo(agg)
             if mongo_agg is not None:
                 group[out_name] = mongo_agg
+                agg_outputs.append(out_name)
 
         self._pipeline.append({"$group": group})
+
+        # MongoDB keeps group keys under ``_id``. Restore them to real fields so
+        # that downstream projections/sorts referencing the key name work, and
+        # reduce any DISTINCT aggregate sets to their final values.
+        if key_restore or distinct_recover:
+            restore: Dict[str, Any] = {"_id": 0}
+            restore.update(key_restore)
+            for out_name in agg_outputs:
+                restore[out_name] = 1
+            for out_name, expr in distinct_recover.items():
+                restore[out_name] = expr
+            self._pipeline.append({"$project": restore})
+            self._saw_project = True
 
     def _handle_distinct(self, node: Distinct) -> None:
         # MongoDB has no standalone DISTINCT in aggregation; the correct
