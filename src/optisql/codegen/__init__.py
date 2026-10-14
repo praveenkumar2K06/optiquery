@@ -1,6 +1,11 @@
 """Backend query generators."""
 from .mongodb import MongoDBGenerator, MongoPipelineResult, generate_mongodb
-from .redis import RedisGenerator, RedisResult, generate_redis
+from .redis import (
+    RedisGenerator,
+    RedisResult,
+    RedisDataModel,
+    generate_redis,
+)
 
 __all__ = [
     "MongoDBGenerator",
@@ -8,5 +13,6 @@ __all__ = [
     "generate_mongodb",
     "RedisGenerator",
     "RedisResult",
+    "RedisDataModel",
     "generate_redis",
 ]

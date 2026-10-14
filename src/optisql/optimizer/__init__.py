@@ -4,8 +4,9 @@ from .passes.projection import ProjectionPushdownPass
 from .passes.constant import ConstantFoldingPass
 from .passes.cse import CommonSubexpressionEliminationPass
 from .passes.limit import LimitPushdownPass
-from .optimizer import QueryOptimizer, OptimizationResult
+from .optimizer import QueryOptimizer, OptimizationResult, CandidatePlan
 from .manager import PassManager
+from .cost import CostModel, CostWeights, PlanCost, ComponentCost
 
 __all__ = [
     "FilterReorderingPass",
@@ -15,5 +16,10 @@ __all__ = [
     "LimitPushdownPass",
     "QueryOptimizer",
     "OptimizationResult",
+    "CandidatePlan",
     "PassManager",
+    "CostModel",
+    "CostWeights",
+    "PlanCost",
+    "ComponentCost",
 ]
