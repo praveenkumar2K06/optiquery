@@ -6,6 +6,7 @@ from .schema import (
     Catalog,
     AGGREGATE_FUNCTIONS,
     SCALAR_FUNCTIONS,
+    AGGREGATE_RESULT_TYPE,
     CatalogProvider,
     InMemoryCatalog,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "Catalog",
     "AGGREGATE_FUNCTIONS",
     "SCALAR_FUNCTIONS",
+    "AGGREGATE_RESULT_TYPE",
     "CatalogProvider",
     "InMemoryCatalog",
 ]

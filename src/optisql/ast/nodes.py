@@ -26,7 +26,17 @@ class Node:
 
 @dataclass
 class Expr(Node):
-    """Base class for expression nodes."""
+    """Base class for expression nodes.
+
+    ``resolved_type`` and ``resolved_field`` are populated by semantic analysis.
+    They are ``None`` until the expression has been successfully resolved, so a
+    consumer can distinguish "not yet analyzed" from "analyzed as unknown".
+    """
+
+    #: The :class:`~optisql.metadata.FieldType` computed for this expression.
+    resolved_type: object = None
+    #: Canonical (unqualified) field name if this is a simple field reference.
+    resolved_field: Optional[str] = None
 
 
 @dataclass
@@ -140,11 +150,19 @@ class IsNullExpr(Expr):
 
 
 @dataclass
+class CaseWhen(Node):
+    """A single WHEN/THEN branch of a CASE expression."""
+
+    condition: Expr = None  # type: ignore[assignment]
+    result: Expr = None  # type: ignore[assignment]
+
+
+@dataclass
 class CaseExpr(Expr):
     """``CASE [operand] WHEN ... THEN ... [ELSE ...] END``."""
 
     operand: Optional[Expr] = None
-    whens: List[tuple] = field(default_factory=list)  # list of (condition, result)
+    whens: List[CaseWhen] = field(default_factory=list)
     default: Optional[Expr] = None
 
 
@@ -298,15 +316,12 @@ def _contains_aggregate(expr: Optional[Expr]) -> bool:
     if isinstance(expr, IsNullExpr):
         return _contains_aggregate(expr.operand)
     if isinstance(expr, CaseExpr):
-        parts = list(expr.whens) + (
-            [(None, expr.default)] if expr.default is not None else []
-        )
+        if expr.operand is not None and _contains_aggregate(expr.operand):
+            return True
         result = False
-        if expr.operand is not None:
-            result = result or _contains_aggregate(expr.operand)
-        for cond, val in parts:
-            result = result or _contains_aggregate(cond) or _contains_aggregate(val)
-        return result
+        for when in expr.whens:
+            result = result or _contains_aggregate(when.condition) or _contains_aggregate(when.result)
+        return result or _contains_aggregate(expr.default)
     return False
 
 

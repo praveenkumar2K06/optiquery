@@ -42,6 +42,7 @@ from ..ast import (
     BetweenExpr,
     BinaryOp,
     CaseExpr,
+    CaseWhen,
     ColumnDef,
     CreateTableStatement,
     DeleteStatement,
@@ -203,6 +204,17 @@ class Parser:
         joins: List[JoinClause] = []
         if self._match(TokenType.FROM):
             from_table = self._parse_table_ref()
+            # Support implicit cross joins: FROM a, b
+            while self._match(TokenType.COMMA):
+                next_table = self._parse_table_ref()
+                joins.append(
+                    JoinClause(
+                        join_type="CROSS",
+                        table=next_table,
+                        condition=None,
+                        span=next_table.span,
+                    )
+                )
             while self._check(
                 TokenType.JOIN,
                 TokenType.INNER,
@@ -582,7 +594,7 @@ class Parser:
             condition = self._parse_expr()
             self._expect(TokenType.THEN, "THEN")
             result = self._parse_expr()
-            whens.append((condition, result))
+            whens.append(CaseWhen(condition=condition, result=result))
 
         default = None
         if self._match(TokenType.ELSE):
