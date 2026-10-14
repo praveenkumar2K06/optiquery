@@ -150,10 +150,13 @@ results.
 ## Supported SQL subset
 
 `SELECT` with projection (including `*`), `FROM`, `WHERE`, `GROUP BY`, `HAVING`,
-`ORDER BY`, `LIMIT`, `OFFSET`, and `DISTINCT`; aggregates `COUNT`, `SUM`, `AVG`,
-`MIN`, `MAX`; scalar functions `ABS`, `LOWER`, `UPPER`, `LENGTH`, `ROUND`,
-`COALESCE`; predicates `=`, `!=`, `<`, `>`, `<=`, `>=`, `IN`, `BETWEEN`, `LIKE`,
-`IS [NOT] NULL`; logical `AND`/`OR`/`NOT`; `CASE` expressions. The parser also
+`ORDER BY` (including columns not in the SELECT list and computed keys),
+`LIMIT`, `OFFSET`, and `DISTINCT`; aggregates `COUNT`, `SUM`, `AVG`, `MIN`,
+`MAX`, including `COUNT`/`SUM`/`AVG` with `DISTINCT`; scalar functions `ABS`,
+`LOWER`, `UPPER`, `LENGTH`, `ROUND`, `COALESCE`; predicates `=`, `!=`, `<`, `>`,
+`<=`, `>=`, `IN`, `BETWEEN`, `LIKE`, `IS [NOT] NULL`; logical `AND`/`OR`/`NOT`;
+`CASE` expressions. Comparisons whose right-hand side is computed (arithmetic,
+function call, or another column) are compiled with `$expr`. The parser also
 recognizes `INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE` and `JOIN` clauses, but
 backend code generation for those is not yet implemented and is reported as an
 explicit error.
