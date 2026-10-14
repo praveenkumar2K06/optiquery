@@ -59,12 +59,33 @@ class MongoDBGenerator:
 
     def generate(self, plan: LogicalPlan) -> MongoPipelineResult:
         self._pipeline = []
+        self._scan_projection: Optional[List[str]] = None
+        self._saw_project = False
         self._visit(plan)
+        self._insert_scan_projection()
         return MongoPipelineResult(
             pipeline=list(self._pipeline),
             diagnostics=self.diagnostics,
             collection=self._collection,
         )
+
+    def _insert_scan_projection(self) -> None:
+        """Insert an early field-limiting $project right after leading $match.
+
+        MongoDB evaluates $match best when it is first (index usage), so rather
+        than emitting a projection at the very start we place it immediately
+        after any leading $match stages. We skip it entirely when a downstream
+        $project already limits the fields.
+        """
+        if not self._scan_projection or self._saw_project:
+            return
+        insert_at = 0
+        while insert_at < len(self._pipeline) and "$match" in self._pipeline[insert_at]:
+            insert_at += 1
+        stage = {"$project": {f: 1 for f in self._scan_projection}}
+        if insert_at < len(self._pipeline) and "$project" in self._pipeline[insert_at]:
+            return
+        self._pipeline.insert(insert_at, stage)
 
     def _visit(self, node: LogicalPlan) -> None:
         if isinstance(node, Scan):
@@ -108,20 +129,98 @@ class MongoDBGenerator:
     def _handle_scan(self, node: Scan) -> None:
         self._collection = node.collection
         if node.projection:
-            self._pipeline.append({"$project": {f: 1 for f in node.projection}})
+            self._scan_projection = list(node.projection)
 
     def _handle_filter(self, node: Filter) -> None:
         if node.predicate is not None:
-            self._pipeline.append({"$match": self._expr_to_mongo(node.predicate)})
+            self._pipeline.append({"$match": self._predicate_to_query(node.predicate)})
+
+    # -- $match query-document generation ---------------------------------
+    #
+    # A $match stage expects a MongoDB *query document* (the same grammar used
+    # by find()), not an aggregation expression. Field comparisons therefore
+    # use the ``{field: {$op: value}}`` form, and field-to-field comparisons are
+    # wrapped in $expr so the aggregation-expression form is valid.
+
+    def _predicate_to_query(self, expr: IRExpr) -> Dict[str, Any]:
+        if isinstance(expr, BinaryExpr) and expr.op in ("AND", "OR"):
+            op = "$and" if expr.op == "AND" else "$or"
+            return {op: [self._predicate_to_query(expr.left), self._predicate_to_query(expr.right)]}
+
+        if isinstance(expr, UnaryExpr) and expr.op == "NOT":
+            # $nor with a single clause negates the inner predicate safely.
+            return {"$nor": [self._predicate_to_query(expr.operand)]}
+
+        if isinstance(expr, BinaryExpr) and expr.op in ("=", "!=", "<", ">", "<=", ">="):
+            left, right = expr.left, expr.right
+            if isinstance(left, ColumnRef) and not isinstance(right, ColumnRef):
+                rhs = self._expr_to_mongo(right)
+                if expr.op == "=" and not isinstance(right, (FunctionExpr,)):
+                    return {left.name: rhs}
+                op = {
+                    "=": "$eq", "!=": "$ne", "<": "$lt", ">": "$gt",
+                    "<=": "$lte", ">=": "$gte",
+                }[expr.op]
+                return {left.name: {op: rhs}}
+            # Field-to-field or computed comparison requires $expr.
+            return {"$expr": self._expr_to_mongo(expr)}
+
+        if isinstance(expr, InListExpr):
+            if isinstance(expr.operand, ColumnRef):
+                values = [self._expr_to_mongo(o) for o in expr.options]
+                op = "$nin" if expr.negated else "$in"
+                return {expr.operand.name: {op: values}}
+            cond = {"$in": [self._expr_to_mongo(expr.operand), [self._expr_to_mongo(o) for o in expr.options]]}
+            return {"$expr": {"$not": cond}} if expr.negated else {"$expr": cond}
+
+        if isinstance(expr, BetweenExpr):
+            if isinstance(expr.operand, ColumnRef):
+                lo = self._expr_to_mongo(expr.low)
+                hi = self._expr_to_mongo(expr.high)
+                query = {expr.operand.name: {"$gte": lo, "$lte": hi}}
+                return {"$nor": [query]} if expr.negated else query
+            cond = {
+                "$and": [
+                    {"$gte": [self._expr_to_mongo(expr.operand), self._expr_to_mongo(expr.low)]},
+                    {"$lte": [self._expr_to_mongo(expr.operand), self._expr_to_mongo(expr.high)]},
+                ]
+            }
+            return {"$expr": {"$not": cond} if expr.negated else {"$expr": cond}}
+
+        if isinstance(expr, IsNullExpr):
+            if isinstance(expr.operand, ColumnRef):
+                return {expr.operand.name: {"$ne": None} if expr.negated else None}
+            return {"$expr": self._expr_to_mongo(expr)}
+
+        if isinstance(expr, LikeExpr):
+            pattern = self._literal_string(expr.pattern)
+            if pattern is not None and isinstance(expr.operand, ColumnRef):
+                regex = "^" + pattern.replace("%", ".*").replace("_", ".") + "$"
+                query = {expr.operand.name: {"$regex": regex}}
+                return {"$nor": [query]} if expr.negated else query
+            return {"$expr": self._expr_to_mongo(expr)}
+
+        # Boolean column used directly, e.g. WHERE active.
+        if isinstance(expr, ColumnRef):
+            return {expr.name: True}
+
+        # Fall back to an $expr-wrapped aggregation expression.
+        return {"$expr": self._expr_to_mongo(expr)}
 
     def _handle_project(self, node: Project) -> None:
         project: Dict[str, Any] = {}
+        has_star = False
         for name, expr in node.items:
-            if isinstance(expr, LiteralValue) and expr.value == "*":
+            if name == "*" or (isinstance(expr, LiteralValue) and expr.value == "*"):
+                has_star = True
                 continue
             project[name] = self._expr_to_mongo(expr)
         if project:
+            self._saw_project = True
             self._pipeline.append({"$project": project})
+        elif has_star:
+            # SELECT *: no projection needed; ensure all fields flow through.
+            self._scan_projection = None
 
     def _handle_sort(self, node: Sort) -> None:
         sort_spec = {}

@@ -1,18 +1,33 @@
-"""Transforms a semantically-analyzed AST into a logical execution plan."""
+"""Transforms a semantically-analyzed AST into a logical execution plan.
+
+Lowering preserves SQL semantics:
+
+* ``WHERE`` is applied before grouping,
+* ``GROUP BY``/aggregates become a :class:`Group` node,
+* ``HAVING`` becomes a :class:`Filter` over the grouped result,
+* the projection is expressed as a :class:`Project` over the grouped or scanned
+  result,
+* ``ORDER BY`` wraps the plan in a :class:`Sort`,
+* ``OFFSET``/``LIMIT`` become :class:`Skip`/:class:`Limit`.
+
+Aggregate calls are collected once and replaced by references to the group's
+output columns, so HAVING and ORDER BY can only reference computed aggregates
+through those outputs.
+"""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
 from ..ast import (
     BinaryOp,
-    CaseExpr,
+    CaseExpr as ASTCaseExpr,
     CaseWhen as ASTCaseWhen,
     DeleteStatement,
     Expr,
     FunctionCall,
     Identifier,
     InsertStatement,
-    IsNullExpr,
+    IsNullExpr as ASTIsNullExpr,
     Literal,
     SelectItem,
     SelectStatement,
@@ -26,41 +41,44 @@ from ..ir import (
     CaseExpr as IRCaseExpr,
     CaseWhen as IRCaseWhen,
     ColumnRef,
+    Distinct,
+    Delete,
+    Filter,
     FunctionExpr,
     InListExpr,
+    Insert,
+    IRExpr,
     IsNullExpr as IRIsNullExpr,
     LikeExpr,
+    Limit,
     LiteralValue,
     LogicalPlan,
-    Distinct,
-    Filter,
-    Group,
-    Insert,
-    Limit,
     Project,
     Scan,
     Skip,
     Sort,
-    Update,
-    Delete,
     UnaryExpr,
+    Update,
+    Group,
 )
 from ..metadata import FieldType
 
-_AGGREGATE_MAP = {
-    "COUNT": True,
-    "SUM": True,
-    "AVG": True,
-    "MIN": True,
-    "MAX": True,
-}
+_AGGREGATE_NAMES = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
+
+#: A sentinel marker used for SELECT * in a projection list.
+STAR_SENTINEL = "*"
+
+
+def _is_aggregate_name(name: str) -> bool:
+    return name.upper() in _AGGREGATE_NAMES
 
 
 class PlanLowerer:
     """Lowers AST statements to IR logical plans."""
 
     def __init__(self):
-        self._next_alias = 0
+        self._agg_key_to_name: Dict[str, str] = {}
+        self._agg_names_used: Dict[str, int] = {}
 
     # -- Entry points ------------------------------------------------------
 
@@ -73,8 +91,11 @@ class PlanLowerer:
             return self._lower_update(stmt)
         if isinstance(stmt, DeleteStatement):
             return self._lower_delete(stmt)
-        # Fallback: return a no-op Scan
-        return Scan(collection="unknown")
+        from ..ir import Scan as _Scan
+
+        return _Scan(collection="unknown")
+
+    # -- SELECT ------------------------------------------------------------
 
     def _lower_select(self, stmt: SelectStatement) -> LogicalPlan:
         plan: LogicalPlan = self._build_base_scan(stmt)
@@ -83,50 +104,16 @@ class PlanLowerer:
             plan = Filter(predicate=self._lower_expr(stmt.where), input=plan)
 
         is_aggregate = bool(stmt.group_by) or self._stmt_has_aggregates(stmt)
+
         if is_aggregate:
-            group_keys = [self._lower_expr(g) for g in stmt.group_by]
-            aggregates: List[Tuple[str, FunctionExpr]] = []
-            # Collect aggregates from projection.
-            for item in stmt.items:
-                aggregates.extend(self._extract_aggregates(item.expr, self._item_name(item)))
-            group_node = Group(group_keys=group_keys, aggregates=aggregates, input=plan)
-            plan = group_node
-            if stmt.having is not None:
-                plan = Filter(predicate=self._lower_expr(stmt.having), input=plan)
-            # For GROUP BY, projection selects the group keys and aggregates.
-            project_items = self._build_group_projection(stmt, group_node)
-            plan = Project(items=project_items, input=plan)
+            plan = self._lower_aggregate_select(stmt, plan)
         else:
-            # Non-aggregate select: project computed columns.
-            project_items = []
-            for item in stmt.items:
-                if isinstance(item.expr, Star):
-                    # For a plain star, include all referenced fields via an
-                    # identity projection (we'll refine with pushdown later).
-                    project_items.append(("*", LiteralValue(value="*", kind="string")))
-                else:
-                    project_items.append((self._item_name(item), self._lower_expr(item.expr)))
-            plan = Project(items=project_items, input=plan)
+            plan = self._lower_plain_select(stmt, plan)
 
         if stmt.distinct and not is_aggregate:
             plan = Distinct(input=plan)
-        # DISTINCT with aggregates is unusual; we skip Distinct after Group.
 
-        # ORDER BY: keys may reference outputs; they also reference original
-        # expressions. We'll lower the expression as written (semantic analyzer
-        # already validated correctness).
-        if stmt.order_by:
-            keys = []
-            for order in stmt.order_by:
-                keys.append((self._lower_expr(order.expr), order.descending))
-            plan = Sort(keys=keys, input=plan)
-
-        if stmt.offset is not None and hasattr(stmt.offset, "value"):
-            plan = Skip(count=int(stmt.offset.value), input=plan)
-        if stmt.limit is not None and hasattr(stmt.limit, "value"):
-            plan = Limit(count=int(stmt.limit.value), input=plan)
-
-        return plan
+        return self._wrap_sort_and_pagination(stmt, plan)
 
     def _build_base_scan(self, stmt: SelectStatement) -> LogicalPlan:
         if stmt.from_table is None:
@@ -135,44 +122,95 @@ class PlanLowerer:
         alias = stmt.from_table.alias or coll
         return Scan(collection=coll, alias=alias)
 
-    def _stmt_has_aggregates(self, stmt: SelectStatement) -> bool:
+    def _lower_plain_select(
+        self, stmt: SelectStatement, plan: LogicalPlan
+    ) -> LogicalPlan:
+        items: List[Tuple[str, IRExpr]] = []
         for item in stmt.items:
-            if self._expr_has_aggregate(item.expr):
-                return True
-        return False
+            if isinstance(item.expr, Star) or self._is_star_projection(item):
+                items.append((STAR_SENTINEL, LiteralValue(value=STAR_SENTINEL, kind="string")))
+            else:
+                items.append((self._item_name(item), self._lower_expr(item.expr)))
+        return Project(items=items, input=plan)
 
-    def _expr_has_aggregate(self, expr: Expr) -> bool:
-        if isinstance(expr, FunctionCall) and _is_aggregate(expr.name):
-            return True
-        if isinstance(expr, BinaryOp):
-            return self._expr_has_aggregate(expr.left) or self._expr_has_aggregate(expr.right)
-        if isinstance(expr, UnaryOp):
-            return self._expr_has_aggregate(expr.operand)
-        return False
+    def _is_star_projection(self, item: SelectItem) -> bool:
+        return isinstance(item.expr, Star)
 
-    def _extract_aggregates(self, expr: Expr, default_name: str) -> List[Tuple[str, FunctionExpr]]:
-        result: List[Tuple[str, FunctionExpr]] = []
-        if isinstance(expr, FunctionCall) and _is_aggregate(expr.name):
-            ir_args = tuple(self._lower_expr(a) for a in expr.args)
-            result.append(
-                (
-                    default_name,
-                    FunctionExpr(
-                        name=expr.name.upper(),
-                        args=ir_args,
-                        distinct=expr.distinct,
-                        aggregate=True,
-                        type=self._aggregate_type(expr.name, ir_args),
-                    ),
-                )
-            )
-            return result
-        if isinstance(expr, BinaryOp):
-            result.extend(self._extract_aggregates(expr.left, default_name + "_left"))
-            result.extend(self._extract_aggregates(expr.right, default_name + "_right"))
-        if isinstance(expr, UnaryOp):
-            result.extend(self._extract_aggregates(expr.operand, default_name))
-        return result
+    def _lower_aggregate_select(
+        self, stmt: SelectStatement, plan: LogicalPlan
+    ) -> LogicalPlan:
+        # Reset per-select aggregate bookkeeping.
+        self._agg_key_to_name = {}
+        self._agg_names_used = {}
+
+        # 1. Register every aggregate call used anywhere in the statement.
+        registered: List[Tuple[str, FunctionCall]] = []
+        for item in stmt.items:
+            for call in self._collect_aggregate_calls(item.expr):
+                name = self._item_name(item) if self._is_bare_aggregate(item.expr) else None
+                self._register_aggregate(call, name, registered)
+        if stmt.having is not None:
+            for call in self._collect_aggregate_calls(stmt.having):
+                self._register_aggregate(call, None, registered)
+        for order in stmt.order_by:
+            for call in self._collect_aggregate_calls(order.expr):
+                self._register_aggregate(call, None, registered)
+
+        aggregates: List[Tuple[str, IRExpr]] = [
+            (name, self._lower_aggregate_call(call)) for name, call in registered
+        ]
+
+        group_keys = [self._lower_expr(g) for g in stmt.group_by]
+        group_node = Group(group_keys=group_keys, aggregates=aggregates, input=plan)
+        result: LogicalPlan = group_node
+
+        if stmt.having is not None:
+            predicate = self._lower_expr_with_aggs(stmt.having)
+            result = Filter(predicate=predicate, input=result)
+
+        # 2. Projection over grouped output.
+        items: List[Tuple[str, IRExpr]] = []
+        for item in stmt.items:
+            if isinstance(item.expr, Star):
+                items.append((STAR_SENTINEL, LiteralValue(value=STAR_SENTINEL, kind="string")))
+                continue
+            if self._is_bare_aggregate(item.expr):
+                out = self._agg_key_to_name[_ast_aggregate_key(item.expr)]
+                items.append((self._item_name(item), ColumnRef(name=out, type=self._aggregate_type(item.expr.name, ()))))
+                continue
+            items.append((self._item_name(item), self._lower_expr_with_aggs(item.expr)))
+        return Project(items=items, input=result)
+
+    # -- Aggregate registration -------------------------------------------
+
+    def _register_aggregate(
+        self,
+        call: FunctionCall,
+        preferred_name: Optional[str],
+        registered: List[Tuple[str, FunctionCall]],
+    ) -> None:
+        key = _ast_aggregate_key(call)
+        if key in self._agg_key_to_name:
+            return
+        base = preferred_name or call.name.upper()
+        name = base
+        count = self._agg_names_used.get(base, 0)
+        while name in self._agg_key_to_name.values():
+            count += 1
+            name = f"{base}_{count}"
+        self._agg_names_used[base] = count
+        self._agg_key_to_name[key] = name
+        registered.append((name, call))
+
+    def _lower_aggregate_call(self, call: FunctionCall) -> FunctionExpr:
+        args = tuple(self._lower_expr(a) for a in call.args)
+        return FunctionExpr(
+            name=call.name.upper(),
+            args=args,
+            distinct=call.distinct,
+            aggregate=True,
+            type=self._aggregate_type(call.name, args),
+        )
 
     def _aggregate_type(self, name: str, args: Tuple) -> FieldType:
         uname = name.upper()
@@ -184,81 +222,79 @@ class PlanLowerer:
             return args[0].type
         return FieldType.ANY
 
-    def _item_name(self, item: SelectItem) -> str:
-        if item.alias:
-            return item.alias
-        if isinstance(item.expr, Identifier):
-            return item.expr.name or (item.expr.parts[-1] if item.expr.parts else "expr")
-        if isinstance(item.expr, FunctionCall):
-            return f"{item.expr.name}"
-        return "expr"
+    def _collect_aggregate_calls(self, expr: Optional[Expr]) -> List[FunctionCall]:
+        result: List[FunctionCall] = []
 
-    def _build_group_projection(
-        self, stmt: SelectStatement, group_node: Group
-    ) -> List[Tuple[str, IRExpr]]:
-        # Map each aggregate output name to its IR expression.
-        agg_map: Dict[str, IRExpr] = {}
-        for out_name, agg_expr in group_node.aggregates:
-            agg_map[out_name] = agg_expr
+        def visit(e: Expr):
+            if isinstance(e, FunctionCall):
+                if _is_aggregate_name(e.name):
+                    result.append(e)
+                    return
+                for a in e.args:
+                    visit(a)
+            elif isinstance(e, BinaryOp):
+                visit(e.left)
+                visit(e.right)
+            elif isinstance(e, UnaryOp):
+                visit(e.operand)
+            elif isinstance(e, ASTCaseExpr):
+                if e.operand is not None:
+                    visit(e.operand)
+                for when in e.whens:
+                    visit(when.condition)
+                    visit(when.result)
+                if e.default is not None:
+                    visit(e.default)
+            elif isinstance(e, ASTIsNullExpr):
+                visit(e.operand)
+            elif hasattr(e, "operand"):
+                visit(getattr(e, "operand"))
 
-        items: List[Tuple[str, IRExpr]] = []
-        # Group keys are available as expressions; also produce them by name.
-        used_keys: List[IRExpr] = list(group_node.group_keys)
-        key_names = []
-        for i, k in enumerate(used_keys):
-            name = self._default_expr_name(k) or f"group_{i}"
-            key_names.append(name)
-            items.append((name, k))
+        visit(expr)
+        return result
 
-        for i, item in enumerate(stmt.items):
-            if isinstance(item.expr, FunctionCall) and _is_aggregate(item.expr.name):
-                name = self._item_name(item)
-                if name in agg_map:
-                    items.append((name, agg_map[name]))
-                else:
-                    items.append((name, self._lower_expr(item.expr)))
-                continue
-            if isinstance(item.expr, BinaryOp) and self._expr_has_aggregate(item.expr):
-                name = self._item_name(item) or f"agg_{i}"
-                # Replace aggregate subexpressions with their grouped forms.
-                lowered = self._replace_aggregates_in_expr(item.expr, agg_map)
-                items.append((name, lowered))
-                continue
-            # A non-aggregate item in GROUP BY context must be a group key.
-            items.append((self._item_name(item), self._lower_expr(item.expr)))
-        return items
-
-    def _replace_aggregates_in_expr(self, expr: Expr, agg_map: Dict[str, IRExpr]) -> IRExpr:
-        if isinstance(expr, FunctionCall) and _is_aggregate(expr.name):
-            key = self._item_name_from_call(expr)
-            if key in agg_map:
-                return agg_map[key]
-        # structural clone
-        from copy import deepcopy
-
-        # For the subset, we don't build complex computed aggregates here.
+    def _lower_expr_with_aggs(self, expr: Expr) -> IRExpr:
+        """Lower an expression inside an aggregate query, replacing aggregate
+        calls with references to the group output columns."""
+        if isinstance(expr, FunctionCall) and _is_aggregate_name(expr.name):
+            key = _ast_aggregate_key(expr)
+            if key in self._agg_key_to_name:
+                return ColumnRef(name=self._agg_key_to_name[key], type=self._aggregate_type(expr.name, ()))
+            # Not registered (shouldn't happen after collection) - register now.
+            registered: List[Tuple[str, FunctionCall]] = []
+            self._register_aggregate(expr, None, registered)
+            return ColumnRef(name=self._agg_key_to_name[key], type=self._aggregate_type(expr.name, ()))
+        if isinstance(expr, BinaryOp):
+            return BinaryExpr(
+                op=expr.op,
+                left=self._lower_expr_with_aggs(expr.left),
+                right=self._lower_expr_with_aggs(expr.right),
+            )
+        if isinstance(expr, UnaryOp):
+            return UnaryExpr(op=expr.op, operand=self._lower_expr_with_aggs(expr.operand))
         return self._lower_expr(expr)
 
-    def _item_name_from_call(self, expr: FunctionCall) -> str:
-        return expr.name.upper()
+    def _stmt_has_aggregates(self, stmt: SelectStatement) -> bool:
+        for item in stmt.items:
+            if self._collect_aggregate_calls(item.expr):
+                return True
+        if stmt.having is not None and self._collect_aggregate_calls(stmt.having):
+            return True
+        return False
 
-    def _default_expr_name(self, expr: IRExpr) -> Optional[str]:
-        if hasattr(expr, "name") and isinstance(getattr(expr, "name"), str):
-            return getattr(expr, "name")
-        return None
+    def _is_bare_aggregate(self, expr: Expr) -> bool:
+        return isinstance(expr, FunctionCall) and _is_aggregate_name(expr.name)
 
     # -- Expression lowering ----------------------------------------------
 
-    def _lower_expr(self, expr: Expr):
+    def _lower_expr(self, expr: Expr) -> IRExpr:
         if isinstance(expr, Literal):
-            kind = expr.kind
-            value = expr.value
-            return LiteralValue(value=value, kind=kind, type=_literal_type(kind))
+            return LiteralValue(value=expr.value, kind=expr.kind, type=_literal_type(expr.kind))
         if isinstance(expr, Identifier):
-            return ColumnRef(
-                name=expr.resolved_field or expr.name or (expr.parts[-1] if expr.parts else ""),
-                source=None,
-            )
+            name = expr.resolved_field or expr.name or (expr.parts[-1] if expr.parts else "")
+            return ColumnRef(name=name)
+        if isinstance(expr, Star):
+            return LiteralValue(value=None, kind="star")
         if isinstance(expr, UnaryOp):
             operand = self._lower_expr(expr.operand)
             if expr.op == "NOT":
@@ -273,39 +309,99 @@ class PlanLowerer:
                 right=self._lower_expr(expr.right),
             )
         if isinstance(expr, FunctionCall):
-            if _is_aggregate(expr.name):
+            args = tuple(self._lower_expr(a) for a in expr.args)
+            if _is_aggregate_name(expr.name):
                 return FunctionExpr(
                     name=expr.name.upper(),
-                    args=tuple(self._lower_expr(a) for a in expr.args),
+                    args=args,
                     distinct=expr.distinct,
                     aggregate=True,
-                    type=self._aggregate_type(expr.name, tuple()),
+                    type=self._aggregate_type(expr.name, args),
                 )
-            args = tuple(self._lower_expr(a) for a in expr.args)
-            return FunctionExpr(
-                name=expr.name.upper(), args=args, distinct=False, aggregate=False
+            return FunctionExpr(name=expr.name.upper(), args=args, distinct=False, aggregate=False)
+        if isinstance(expr, ASTIsNullExpr):
+            return IRIsNullExpr(operand=self._lower_expr(expr.operand), negated=expr.negated)
+        if isinstance(expr, ASTCaseExpr):
+            whens = tuple(
+                IRCaseWhen(
+                    condition=self._lower_expr(w.condition),
+                    result=self._lower_expr(w.result),
+                )
+                for w in expr.whens
             )
-        if isinstance(expr, (IsNullExpr,)):
-            # AST IsNullExpr -> IRIsNullExpr
-            from ..ast import IsNullExpr as AIN
+            default = self._lower_expr(expr.default) if expr.default is not None else None
+            return IRCaseExpr(whens=whens, default=default)
+        if isinstance(expr, ASTIsNullExpr):
+            return IRIsNullExpr(operand=self._lower_expr(expr.operand), negated=expr.negated)
+        # InList / Between / Like: reachable through the AST module classes.
+        return self._lower_constraint(expr)
 
-            a = expr
-            return IRIsNullExpr(
-                operand=self._lower_expr(a.operand), negated=a.negated
+    def _lower_constraint(self, expr: Expr) -> IRExpr:
+        from ..ast import BetweenExpr as ASTBetween, InListExpr as ASTInList, LikeExpr as ASTLike
+
+        if isinstance(expr, ASTInList):
+            return InListExpr(
+                operand=self._lower_expr(expr.operand),
+                options=tuple(self._lower_expr(o) for o in expr.options),
+                negated=expr.negated,
             )
-        # Fallback: boolean literal false
+        if isinstance(expr, ASTBetween):
+            return BetweenExpr(
+                operand=self._lower_expr(expr.operand),
+                low=self._lower_expr(expr.low),
+                high=self._lower_expr(expr.high),
+                negated=expr.negated,
+            )
+        if isinstance(expr, ASTLike):
+            return LikeExpr(
+                operand=self._lower_expr(expr.operand),
+                pattern=self._lower_expr(expr.pattern),
+                negated=expr.negated,
+            )
         return LiteralValue(value=False, kind="boolean", type=FieldType.BOOLEAN)
 
+    # -- ORDER BY / pagination --------------------------------------------
+
+    def _wrap_sort_and_pagination(
+        self, stmt: SelectStatement, plan: LogicalPlan
+    ) -> LogicalPlan:
+        if stmt.order_by:
+            keys = []
+            for order in stmt.order_by:
+                expr = self._lower_order_expr(order.expr)
+                keys.append((expr, order.descending))
+            plan = Sort(keys=keys, input=plan)
+
+        if stmt.offset is not None and isinstance(stmt.offset, Literal):
+            plan = Skip(count=int(stmt.offset.value), input=plan)
+        if stmt.limit is not None and isinstance(stmt.limit, Literal):
+            plan = Limit(count=int(stmt.limit.value), input=plan)
+        return plan
+
+    def _lower_order_expr(self, expr: Expr) -> IRExpr:
+        if self._agg_key_to_name:
+            return self._lower_expr_with_aggs(expr)
+        return self._lower_expr(expr)
+
+    # -- Names -------------------------------------------------------------
+
+    def _item_name(self, item: SelectItem) -> str:
+        if item.alias:
+            return item.alias
+        if isinstance(item.expr, Identifier):
+            return item.expr.name or (item.expr.parts[-1] if item.expr.parts else "expr")
+        if isinstance(item.expr, FunctionCall):
+            return item.expr.name
+        return "expr"
+
+    # -- INSERT / UPDATE / DELETE -----------------------------------------
+
     def _lower_insert(self, stmt: InsertStatement) -> LogicalPlan:
-        rows = []
-        for row in stmt.rows:
-            rows.append([self._lower_expr(v) for v in row])
+        rows = [[self._lower_expr(v) for v in row] for row in stmt.rows]
         return Insert(collection=stmt.table.name, columns=stmt.columns, rows=rows)
 
     def _lower_update(self, stmt: UpdateStatement) -> LogicalPlan:
-        assignments = []
-        for a in stmt.assignments:
-            assignments.append((a.field, self._lower_expr(a.value)))
+        assignments = [(a.field, self._lower_expr(a.value)) for a in stmt.assignments]
         pred = self._lower_expr(stmt.where) if stmt.where is not None else None
         return Update(collection=stmt.table.name, assignments=assignments, predicate=pred)
 
@@ -314,8 +410,9 @@ class PlanLowerer:
         return Delete(collection=stmt.table.name, predicate=pred)
 
 
-def _is_aggregate(name: str) -> bool:
-    return name.upper() in _AGGREGATE_MAP
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _literal_type(kind: str) -> FieldType:
@@ -326,6 +423,36 @@ def _literal_type(kind: str) -> FieldType:
         "boolean": FieldType.BOOLEAN,
         "null": FieldType.NULL,
     }.get(kind, FieldType.ANY)
+
+
+def _ast_aggregate_key(call: FunctionCall) -> str:
+    """A structural key identifying an aggregate call within one SELECT."""
+    parts = []
+    for arg in call.args:
+        parts.append(_ast_expr_key(arg))
+    distinct = "DISTINCT " if call.distinct else ""
+    return f"{call.name.upper()}({distinct}{', '.join(parts)})"
+
+
+def _ast_expr_key(expr: Optional[Expr]) -> str:
+    if expr is None:
+        return "NULL"
+    if isinstance(expr, Literal):
+        if expr.kind == "string":
+            return "'" + str(expr.value) + "'"
+        return str(expr.value)
+    if isinstance(expr, Identifier):
+        return expr.qualified_name.lower() if hasattr(expr, "qualified_name") else expr.name.lower()
+    if isinstance(expr, Star):
+        return "*"
+    if isinstance(expr, BinaryOp):
+        return f"({_ast_expr_key(expr.left)} {expr.op} {_ast_expr_key(expr.right)})"
+    if isinstance(expr, UnaryOp):
+        return f"{expr.op}{_ast_expr_key(expr.operand)}"
+    if isinstance(expr, FunctionCall):
+        args = ", ".join(_ast_expr_key(a) for a in expr.args)
+        return f"{expr.name.upper()}({args})"
+    return repr(expr)
 
 
 def lower(stmt) -> LogicalPlan:
