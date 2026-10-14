@@ -123,3 +123,17 @@ def test_semantic_incompatible_comparison_type(sample_catalog):
     # May or may not error depending on strictness - we defined numeric cross OK
     # 'old' is string, age is int; different types -> error
     assert not res.ok or any(d.code == "E3007" for d in res.diagnostics.errors)
+
+
+def test_semantic_length_returns_integer(sample_catalog):
+    # LENGTH returns a character count, so comparing it with an integer column
+    # must type-check.
+    stmt = parse_or_raise("SELECT * FROM users WHERE age = LENGTH(name)")
+    res = analyze(stmt, sample_catalog)
+    assert res.ok
+
+
+def test_semantic_length_compared_to_string_is_error(sample_catalog):
+    stmt = parse_or_raise("SELECT * FROM users WHERE country = LENGTH(name)")
+    res = analyze(stmt, sample_catalog)
+    assert any(d.code == "E3007" for d in res.diagnostics.errors)

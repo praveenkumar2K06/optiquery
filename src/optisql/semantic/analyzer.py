@@ -515,12 +515,24 @@ class SemanticAnalyzer:
         if name in SCALAR_FUNCTIONS:
             for arg in expr.args:
                 self._check_expr(arg, allow_aggregate)
-            if name in ("LOWER", "UPPER", "LENGTH") and expr.args:
+            if name in ("LOWER", "UPPER") and expr.args:
                 expr.resolved_type = FieldType.STRING
                 return FieldType.STRING
+            if name == "LENGTH" and expr.args:
+                # LENGTH returns the number of characters, an integer.
+                expr.resolved_type = FieldType.INTEGER
+                return FieldType.INTEGER
             if name in ("ABS", "ROUND") and expr.args:
                 expr.resolved_type = _as_field_type(expr.args[0].resolved_type) or FieldType.DECIMAL
                 return _as_field_type(expr.resolved_type)
+            if name == "COALESCE" and expr.args:
+                result = FieldType.ANY
+                for arg in expr.args:
+                    result = _unify_types(result, _as_field_type(arg.resolved_type))
+                if result is FieldType.ANY:
+                    result = _as_field_type(expr.args[0].resolved_type) or FieldType.ANY
+                expr.resolved_type = result
+                return result
             expr.resolved_type = FieldType.ANY
             return FieldType.ANY
 

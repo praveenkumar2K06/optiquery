@@ -160,9 +160,13 @@ class MongoDBGenerator:
 
         if isinstance(expr, BinaryExpr) and expr.op in ("=", "!=", "<", ">", "<=", ">="):
             left, right = expr.left, expr.right
-            if isinstance(left, ColumnRef) and not isinstance(right, ColumnRef):
+            # Query-document operators only accept literal values as their
+            # operand. A computed right-hand side (arithmetic, function, CASE, or
+            # another column) must go through $expr with an aggregation
+            # expression, or MongoDB would misinterpret the operator argument.
+            if isinstance(left, ColumnRef) and isinstance(right, LiteralValue):
                 rhs = self._expr_to_mongo(right)
-                if expr.op == "=" and not isinstance(right, (FunctionExpr,)):
+                if expr.op == "=":
                     return {left.name: rhs}
                 op = {
                     "=": "$eq", "!=": "$ne", "<": "$lt", ">": "$gt",

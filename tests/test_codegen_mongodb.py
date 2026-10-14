@@ -264,6 +264,30 @@ def test_scalar_function_in_predicate_uses_expr():
     assert match == {"$expr": {"$eq": [{"$toUpper": "$country"}, "INDIA"]}}
 
 
+def test_computed_rhs_comparison_uses_expr_not_query_document():
+    # age > age * 2 has a computed right-hand side, so it must use $expr rather
+    # than a query-document operator whose operand would be misinterpreted.
+    plan = Filter(
+        predicate=BinaryExpr(
+            op=">",
+            left=ColumnRef("age"),
+            right=BinaryExpr(op="*", left=ColumnRef("age"), right=_lit(2)),
+        ),
+        input=Scan(collection="users"),
+    )
+    match = generate_mongodb(plan).pipeline[0]["$match"]
+    assert match == {"$expr": {"$gt": ["$age", {"$multiply": ["$age", 2]}]}}
+
+
+def test_literal_rhs_comparison_uses_query_document():
+    plan = Filter(
+        predicate=BinaryExpr(op=">=", left=ColumnRef("age"), right=_lit(18)),
+        input=Scan(collection="users"),
+    )
+    match = generate_mongodb(plan).pipeline[0]["$match"]
+    assert match == {"age": {"$gte": 18}}
+
+
 def test_computed_sort_key_is_materialized_and_removed():
     plan = Project(
         items=[("doubled", BinaryExpr(op="*", left=ColumnRef("age"), right=_lit(2)))],
