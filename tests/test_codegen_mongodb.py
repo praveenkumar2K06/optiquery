@@ -186,3 +186,79 @@ def test_distinct_star_is_rejected_not_wrong():
     assert any(d.code == "E7004" for d in result.diagnostics.errors)
     # No misleading pipeline is produced.
     assert result.pipeline == []
+
+
+def _project_expr(name, expr):
+    return Project(items=[(name, expr)], input=Scan(collection="users"))
+
+
+def test_scalar_function_translation():
+    from optisql.ir import FunctionExpr
+
+    cases = {
+        "ABS": {"$abs": "$age"},
+        "LOWER": {"$toLower": "$name"},
+        "UPPER": {"$toUpper": "$name"},
+        "LENGTH": {"$strLenCP": "$name"},
+    }
+    for fn, expected in cases.items():
+        expr = FunctionExpr(
+            name=fn, args=(ColumnRef("age" if fn == "ABS" else "name"),), aggregate=False
+        )
+        pipeline = generate_mongodb(_project_expr("out", expr)).pipeline
+        assert pipeline[0]["$project"]["out"] == expected
+
+
+def test_round_and_coalesce_translation():
+    from optisql.ir import FunctionExpr
+
+    rounded = FunctionExpr(
+        name="ROUND",
+        args=(ColumnRef("total"), LiteralValue(value=2, kind="integer")),
+        aggregate=False,
+    )
+    pipeline = generate_mongodb(_project_expr("r", rounded)).pipeline
+    assert pipeline[0]["$project"]["r"] == {"$round": ["$total", 2]}
+
+    coalesced = FunctionExpr(
+        name="COALESCE",
+        args=(ColumnRef("email"), _lit("none", "string")),
+        aggregate=False,
+    )
+    pipeline = generate_mongodb(_project_expr("e", coalesced)).pipeline
+    assert pipeline[0]["$project"]["e"] == {"$ifNull": ["$email", "none"]}
+
+
+def test_case_expression_translation():
+    from optisql.ir import CaseExpr, CaseWhen
+
+    case = CaseExpr(
+        whens=(
+            CaseWhen(
+                condition=BinaryExpr(
+                    op=">=", left=ColumnRef("age"), right=_lit(18)
+                ),
+                result=_lit("adult", "string"),
+            ),
+        ),
+        default=_lit("minor", "string"),
+    )
+    pipeline = generate_mongodb(_project_expr("kind", case)).pipeline
+    assert pipeline[0]["$project"]["kind"] == {
+        "$cond": [{"$gte": ["$age", 18]}, "adult", "minor"]
+    }
+
+
+def test_scalar_function_in_predicate_uses_expr():
+    from optisql.ir import FunctionExpr
+
+    plan = Filter(
+        predicate=BinaryExpr(
+            op="=",
+            left=FunctionExpr(name="UPPER", args=(ColumnRef("country"),)),
+            right=_lit("INDIA", "string"),
+        ),
+        input=Scan(collection="users"),
+    )
+    match = generate_mongodb(plan).pipeline[0]["$match"]
+    assert match == {"$expr": {"$eq": [{"$toUpper": "$country"}, "INDIA"]}}

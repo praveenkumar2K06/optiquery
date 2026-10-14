@@ -1,0 +1,25 @@
+{
+  "collections": {
+    "users": {
+      "cardinality": 10000,
+      "avg_doc_size": 300,
+      "fields": {
+        "id": { "type": "integer", "indexed": true, "nullable": false },
+        "name": { "type": "string" },
+        "age": { "type": "integer", "indexed": true },
+        "country": { "type": "string", "indexed": true },
+        "email": { "type": "string", "nullable": true }
+      }
+    },
+    "orders": {
+      "cardinality": 50000,
+      "avg_doc_size": 200,
+      "fields": {
+        "id": { "type": "integer", "indexed": true },
+        "user_id": { "type": "integer", "indexed": true },
+        "total": { "type": "decimal" },
+        "status": { "type": "string" }
+      }
+    }
+  }
+}

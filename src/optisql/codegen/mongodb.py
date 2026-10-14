@@ -15,6 +15,7 @@ from ..diagnostics import DiagnosticBag
 from ..ir import (
     BetweenExpr,
     BinaryExpr,
+    CaseExpr,
     ColumnRef,
     Distinct,
     Filter,
@@ -61,8 +62,14 @@ class MongoDBGenerator:
         self._pipeline = []
         self._scan_projection: Optional[List[str]] = None
         self._saw_project = False
+        self._failed = False
         self._visit(plan)
-        self._insert_scan_projection()
+        if self._failed:
+            # A stage could not be translated. Return no pipeline rather than a
+            # query that would silently return wrong or empty results.
+            self._pipeline = []
+        else:
+            self._insert_scan_projection()
         return MongoPipelineResult(
             pipeline=list(self._pipeline),
             diagnostics=self.diagnostics,
@@ -394,7 +401,60 @@ class MongoDBGenerator:
         if isinstance(expr, InListExpr):
             cond = {"$in": [self._expr_to_mongo(expr.operand), [self._expr_to_mongo(o) for o in expr.options]]}
             return {"$not": cond} if expr.negated else cond
+        if isinstance(expr, FunctionExpr):
+            return self._scalar_function_to_mongo(expr)
+        if isinstance(expr, CaseExpr):
+            return self._case_to_mongo(expr)
+        self._failed = True
+        self.diagnostics.error(
+            "E7005",
+            f"MongoDB codegen cannot translate expression '{type(expr).__name__}'",
+            None,
+        )
         return None
+
+    # -- Scalar functions and CASE ----------------------------------------
+
+    def _scalar_function_to_mongo(self, func: FunctionExpr) -> Any:
+        """Translate a supported scalar function to a MongoDB expression."""
+        name = func.name.upper()
+        args = [self._expr_to_mongo(a) for a in func.args]
+        single = args[0] if args else None
+
+        if name == "ABS" and len(args) == 1:
+            return {"$abs": single}
+        if name == "LOWER" and len(args) == 1:
+            return {"$toLower": single}
+        if name == "UPPER" and len(args) == 1:
+            return {"$toUpper": single}
+        if name == "LENGTH" and len(args) == 1:
+            return {"$strLenCP": single}
+        if name == "ROUND" and len(args) in (1, 2):
+            place = args[1] if len(args) == 2 else 0
+            return {"$round": [single, place]}
+        if name == "COALESCE" and args:
+            expr = args[-1]
+            for arg in reversed(args[:-1]):
+                expr = {"$ifNull": [arg, expr]}
+            return expr
+
+        self._failed = True
+        self.diagnostics.error(
+            "E7005",
+            f"MongoDB codegen does not support scalar function {name}",
+            None,
+        )
+        return None
+
+    def _case_to_mongo(self, expr: CaseExpr) -> Any:
+        """Translate a searched CASE expression using nested $cond."""
+        result = self._expr_to_mongo(expr.default) if expr.default is not None else None
+        for when in reversed(expr.whens):
+            condition = self._expr_to_mongo(when.condition)
+            value = self._expr_to_mongo(when.result)
+            result = {"$cond": [condition, value, result]}
+        return result
+
 
     @staticmethod
     def _literal_string(expr: IRExpr) -> Optional[str]:
