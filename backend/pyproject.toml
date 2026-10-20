@@ -1,0 +1,37 @@
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[project]
+name = "optisql"
+version = "0.1.0"
+description = "OptiQuery - SQL-to-NoSQL query compiler with cost-based optimizer (FastAPI Web Backend)"
+readme = "../README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "fastapi>=0.124.4",
+    "uvicorn>=0.33.0",
+]
+
+[project.scripts]
+optisql-web = "optisql.api.server:main"
+
+[project.optional-dependencies]
+mongodb = ["pymongo>=4.0"]
+redis = ["redis>=4.0"]
+all = [
+    "pymongo>=4.0",
+    "redis>=4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "httpx>=0.28.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-v"
+

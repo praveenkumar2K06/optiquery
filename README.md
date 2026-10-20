@@ -68,34 +68,57 @@ model, and only then translated into a backend query.
 
 ```bash
 # Using uv (recommended)
-uv venv .venv
-uv pip install -e .
+uv sync
 
-# or with pip
-pip install -e .
+# Install with optional database backend drivers (MongoDB / Redis)
+uv sync --extra all
+# or individually:
+uv sync --extra mongodb
+uv sync --extra redis
 ```
 
-Backends are optional. To enable live execution install the relevant driver:
+Backends are optional. The query compiler and optimizer work out of the box with zero external dependencies.
 
-```bash
-pip install pymongo   # MongoDB execution
-pip install redis     # Redis execution
+## Project Structure
+
+```
+├── backend/              # Python FastAPI REST Backend & OptiQuery Compiler
+│   ├── src/optisql/      # Compiler pipeline (AST, IR, Lexer, Parser, Optimizer, Codegen)
+│   │   ├── api/          # FastAPI routes, models, serializer, and services
+│   │   └── ...           # Compiler phases
+│   ├── tests/            # Pytest test suite (compiler & API tests)
+│   └── pyproject.toml    # Backend package & dependencies
+├── frontend/             # React SPA (Vite + React 19 + Tailwind CSS + Lucide Icons)
+│   ├── src/              # React components & workbench UI
+│   ├── index.html        # Entry HTML
+│   └── package.json      # Node dependencies & scripts
+└── examples/             # Example schemas (e.g. schema.json)
 ```
 
 ## Usage
 
-### Command line
+### Interactive Web UI (React + FastAPI)
+
+OptiQuery includes a developer-grade web workbench with a **React SPA frontend** and a **FastAPI REST API backend**.
 
 ```bash
-python -m optisql "SELECT name, age FROM users WHERE age >= 18 ORDER BY age LIMIT 10"
-python -m optisql --schema examples/schema.json "SELECT country, COUNT(*) FROM users GROUP BY country"
-python -m optisql --backend redis "SELECT name FROM users WHERE id = 42"
-python -m optisql --no-optimize --explain "SELECT * FROM users"
-python -m optisql --json "SELECT name FROM users LIMIT 3"
+# Start the FastAPI web server (serves the pre-built React workbench on port 8000)
+uv run optisql-web
+# or via python module:
+python -m optisql
 ```
 
-Flags: `--backend/-b`, `--schema/-s`, `--no-optimize`, `--explain`, `--ast`,
-`--json`.
+- **Web Workbench**: Open [http://localhost:8000](http://localhost:8000)
+- **Interactive OpenAPI / Swagger Documentation**: Open [http://localhost:8000/docs](http://localhost:8000/docs)
+
+### React Frontend Development
+
+```bash
+cd frontend
+bun install   # or pnpm install
+bun run dev   # launches Vite dev server with proxy to FastAPI on port 5173
+bun run build # builds static distribution into frontend/dist
+```
 
 ### Python API
 
@@ -198,8 +221,14 @@ Diagnostics carry a machine-readable code and, when available, a source span:
 ## Development
 
 ```bash
-# Run the test suite (uses pythonpath=src from pyproject.toml)
-.venv/bin/python -m pytest tests/ -q
+# Sync the development environment (including pytest)
+uv sync
+
+# Run the test suite
+uv run pytest
+
+# Build distribution packages (wheel and sdist)
+uv build
 ```
 
 ## Project layout

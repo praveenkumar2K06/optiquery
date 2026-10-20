@@ -18,3 +18,8 @@ env/
 .env
 *.local.toml
 optisql.local.toml
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/

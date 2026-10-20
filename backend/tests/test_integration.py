@@ -8,7 +8,6 @@ import json
 
 import pytest
 
-from optisql.cli.main import main as cli_main
 from optisql.compiler import Compiler
 from optisql.metadata import Catalog
 
@@ -195,60 +194,4 @@ def test_redis_unsupported_shape_is_structured_error(compiler):
     assert any(d.code.startswith("E8") for d in result.diagnostics.items)
 
 
-# -- CLI --------------------------------------------------------------------
 
-
-def test_cli_prints_pipeline(capsys, sample_catalog, tmp_path):
-    schema = {
-        "collections": {
-            "users": {
-                "fields": {
-                    "id": {"type": "integer", "indexed": True},
-                    "name": {"type": "string"},
-                    "age": {"type": "integer", "indexed": True},
-                }
-            }
-        }
-    }
-    schema_path = tmp_path / "schema.json"
-    schema_path.write_text(json.dumps(schema))
-
-    code = cli_main(
-        [
-            "--schema",
-            str(schema_path),
-            "--backend",
-            "mongodb",
-            "SELECT name FROM users WHERE age >= 18",
-        ]
-    )
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "MongoDB Aggregation Pipeline" in out
-    assert "$match" in out
-
-
-def test_cli_json_mode(capsys, tmp_path):
-    schema_path = tmp_path / "schema.json"
-    schema_path.write_text(json.dumps({"collections": {}}))
-    code = cli_main(
-        [
-            "--schema",
-            str(schema_path),
-            "--json",
-            "SELECT name FROM users WHERE age = 1",
-        ]
-    )
-    out = capsys.readouterr().out
-    payload = json.loads(out)
-    assert payload["backend"] == "mongodb"
-    # The CLI uses a permissive catalog, so an unknown collection is a warning
-    # and compilation still succeeds.
-    assert code == 0
-    assert payload["ok"] is True
-    assert payload["query"][0] == {"$match": {"age": 1}}
-
-
-def test_cli_no_args_returns_usage_code(capsys):
-    code = cli_main([])
-    assert code == 2
